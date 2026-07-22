@@ -1,0 +1,311 @@
+name: Personal Dev Update
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: Rebuild even when the source SHA is unchanged
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: personal-dev-update
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  JAVA_VERSION: '21'
+  NODE_VERSION: '22'
+  ANDROID_NDK_VERSION: '25.1.8937393'
+  ANDROID_CMAKE_VERSION: '3.22.1'
+  MANUAL_DEPS_DIR: manual-deps
+  OPERIT_RELEASE_CERT_SHA256: '40:F8:7A:4D:66:EB:70:D0:E2:D1:37:9C:6A:97:DD:DC:0C:ED:D3:BA:87:2E:02:74:50:CA:77:AF:42:EC:5E:74'
+
+jobs:
+  check-source:
+    name: Check personal/dev source
+    runs-on: ubuntu-24.04
+    outputs:
+      should_build: ${{ steps.source.outputs.should_build }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - name: Checkout personal/dev
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: CATMIAOZHI/Operit
+          ref: personal/dev
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Compare source with latest dev release
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild || false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="$(git -C source rev-parse HEAD)"
+          releases_file="$RUNNER_TEMP/nightly-releases.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100&page=1" > "$releases_file"
+          latest_sha="$(
+            python3 - "$releases_file" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              releases = json.load(stream)
+          for release in releases:
+              if release.get("draft"):
+                  continue
+              try:
+                  metadata = json.loads(release.get("body") or "")
+              except (TypeError, json.JSONDecodeError):
+                  continue
+              if metadata.get("channel") != "personal-dev":
+                  continue
+              assets = [str(asset.get("name", "")) for asset in release.get("assets", [])]
+              has_apk = any(name.endswith(".apk") for name in assets)
+              has_patch = any(name.startswith("apkrawpatch_") and name.endswith(".zip") for name in assets)
+              has_meta = any(name.startswith("patch_") and name.endswith(".json") for name in assets)
+              complete = has_apk and (metadata.get("format") == "full-apk" or (has_patch and has_meta))
+              if complete:
+                  print(metadata.get("sourceSha", ""))
+                  break
+          PY
+          )"
+          should_build=true
+          if [[ ! -f source/tools/hotbuild/publish_dev_update.py ]]; then
+            echo '::notice::personal/dev does not contain the development update publisher yet.'
+            should_build=false
+          elif [[ "$FORCE_REBUILD" != 'true' && "$source_sha" == "$latest_sha" ]]; then
+            should_build=false
+          fi
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+
+  build-and-publish:
+    name: Build and publish development update
+    needs: check-source
+    if: needs.check-source.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      OPERIT_DEV_BUILD_NUMBER: ${{ github.run_number }}
+    defaults:
+      run:
+        working-directory: source
+
+    steps:
+      - name: Checkout personal/dev
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: CATMIAOZHI/Operit
+          ref: ${{ needs.check-source.outputs.source_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Initialize terminal submodule
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule sync -- terminal
+          git submodule update --init --recursive --depth 1 terminal
+          git submodule status -- terminal
+
+      - name: Set up JDK
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+        with:
+          cache-read-only: false
+          cache-cleanup: on-success
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+
+      - name: Install Android SDK, NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-36" \
+            "build-tools;34.0.0" \
+            "build-tools;35.0.0" \
+            "ndk;$ANDROID_NDK_VERSION" \
+            "cmake;$ANDROID_CMAKE_VERSION"
+
+      - name: Restore Android dependency cache
+        id: cache-manual-deps
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: source/${{ env.MANUAL_DEPS_DIR }}
+          key: android-full-deps-${{ runner.os }}-${{ hashFiles('source/ci/script/download_android_dependencies.sh', 'source/ci/script/prepare_android_dependencies.py') }}
+
+      - name: Download Android dependencies
+        if: steps.cache-manual-deps.outputs.cache-hit != 'true'
+        run: bash ci/script/download_android_dependencies.sh full "$MANUAL_DEPS_DIR"
+
+      - name: Prepare Android dependencies
+        run: |
+          python3 ci/script/prepare_android_dependencies.py \
+            --profile full \
+            --archives "$MANUAL_DEPS_DIR" \
+            --repository "$GITHUB_WORKSPACE/source"
+
+      - name: Restore native ripgrep cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            source/tools/native_ripgrep/target
+          key: native-ripgrep-arm64-${{ runner.os }}-${{ hashFiles('source/tools/native_ripgrep/Cargo.lock') }}
+
+      - name: Build native ripgrep
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup target add --toolchain 1.88.0 aarch64-linux-android
+          cargo +1.88.0 build \
+            --manifest-path tools/native_ripgrep/Cargo.toml \
+            --release \
+            --target aarch64-linux-android \
+            --locked
+          install -Dm755 \
+            tools/native_ripgrep/target/aarch64-linux-android/release/liboperit_ripgrep.so \
+            app/src/main/jniLibs/arm64-v8a/liboperit_ripgrep.so
+          test -s app/src/main/jniLibs/arm64-v8a/liboperit_ripgrep.so
+
+      - name: Install JavaScript dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g pnpm@10.34.5
+          npm ci --no-audit --no-fund
+          npm --prefix web-chat ci --no-audit --no-fund
+
+      - name: Build WebChat assets
+        run: |
+          npm --prefix web-chat run typecheck
+          npm run build:webchat
+
+      - name: Build bundled ToolPkg packages
+        run: |
+          npm run build:examples:github
+          git diff --exit-code -- examples/github.js
+          python3 tools/example_packages/sync_example_packages.py --no-hot-reload
+
+      - name: Configure identical Operit Ry signing
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.OPERIT_RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.OPERIT_RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.OPERIT_RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.OPERIT_RELEASE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${RELEASE_KEYSTORE_BASE64:?OPERIT_RELEASE_KEYSTORE_BASE64 is required}"
+          : "${RELEASE_STORE_PASSWORD:?OPERIT_RELEASE_STORE_PASSWORD is required}"
+          : "${RELEASE_KEY_ALIAS:?OPERIT_RELEASE_KEY_ALIAS is required}"
+          : "${RELEASE_KEY_PASSWORD:?OPERIT_RELEASE_KEY_PASSWORD is required}"
+
+          release_keystore="$RUNNER_TEMP/operit-ry-release.jks"
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$release_keystore"
+          chmod 600 "$release_keystore"
+
+          actual_cert_sha256="$(
+            keytool -list -v \
+              -keystore "$release_keystore" \
+              -storepass "$RELEASE_STORE_PASSWORD" \
+              -alias "$RELEASE_KEY_ALIAS" \
+              | sed -n 's/^[[:space:]]*SHA256: //p'
+          )"
+          if [[ "$actual_cert_sha256" != "$OPERIT_RELEASE_CERT_SHA256" ]]; then
+            echo 'Signing certificate does not match the existing Operit Ry development builds.' >&2
+            exit 1
+          fi
+
+          umask 077
+          {
+            echo "sdk.dir=$ANDROID_HOME"
+            echo 'GITHUB_CLIENT_ID='
+            echo 'GITHUB_CLIENT_SECRET='
+            echo "RELEASE_STORE_FILE=$release_keystore"
+            echo "RELEASE_STORE_PASSWORD=$RELEASE_STORE_PASSWORD"
+            echo "RELEASE_KEY_ALIAS=$RELEASE_KEY_ALIAS"
+            echo "RELEASE_KEY_PASSWORD=$RELEASE_KEY_PASSWORD"
+          } > local.properties
+
+      - name: Build development APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Verify development APK identity and signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk='app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$apk"
+          application_id="$($ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer manifest application-id "$apk")"
+          test "$application_id" = 'com.rainy.operitry.dev'
+          expected_digest="${OPERIT_RELEASE_CERT_SHA256//:/}"
+          expected_digest="${expected_digest,,}"
+          certificate="$($ANDROID_HOME/build-tools/35.0.0/apksigner verify --print-certs "$apk")"
+          grep -Fqi "Signer #1 certificate SHA-256 digest: $expected_digest" <<< "$certificate"
+
+      - name: Publish full APK or differential update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.check-source.outputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk='app/build/outputs/apk/debug/app-debug.apk'
+          version="$($ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer manifest version-name "$apk")"
+          series="${version%.*}"
+          python3 tools/hotbuild/publish_dev_update.py \
+            --apk "$apk" \
+            --version "$version" \
+            --build-number "$GITHUB_RUN_NUMBER" \
+            --series "$series" \
+            --source-sha "$SOURCE_SHA"
+
+      - name: Upload development APK artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: operit-ry-dev-${{ github.run_number }}
+          path: source/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
