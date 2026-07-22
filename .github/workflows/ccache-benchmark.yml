@@ -1,0 +1,456 @@
+name: ccache benchmark
+
+# Read-only A/B experiment to validate whether ccache with CCACHE_COMPILERCHECK=content
+# materially speeds up repeated native builds on the same source SHA.
+# This workflow never publishes a Release; it only builds, measures, and uploads artifacts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Operit personal/dev commit SHA to benchmark (defaults to personal/dev HEAD)
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: ccache-benchmark
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: '21'
+  NODE_VERSION: '22'
+  ANDROID_NDK_VERSION: '25.1.8937393'
+  ANDROID_CMAKE_VERSION: '3.22.1'
+  MANUAL_DEPS_DIR: manual-deps
+  # ccache configuration under test.
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 2G
+  CCACHE_BASEDIR: ${{ github.workspace }}/source
+  CCACHE_COMPILERCHECK: content
+  CMAKE_C_COMPILER_LAUNCHER: ccache
+  CMAKE_CXX_COMPILER_LAUNCHER: ccache
+
+jobs:
+  resolve-source:
+    name: Resolve source SHA
+    runs-on: ubuntu-24.04
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+    steps:
+      - name: Resolve personal/dev HEAD
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="${{ inputs.source_sha }}"
+          if [[ -z "$sha" ]]; then
+            sha="$(git ls-remote https://github.com/CATMIAOZHI/Operit.git refs/heads/personal/dev | awk '{print $1}')"
+          fi
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Resolved source is not a 40-char SHA: $sha"
+            exit 1
+          fi
+          echo "source_sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Benchmarking source SHA: $sha"
+
+  cold-build:
+    name: Cold build (pass 1, populates ccache)
+    needs: resolve-source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - name: Checkout Operit source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: CATMIAOZHI/Operit
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Initialize terminal submodule
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule sync -- terminal
+          git submodule update --init --recursive --depth 1 terminal
+          git submodule status -- terminal
+
+      - name: Set up JDK
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+
+      - name: Install Android SDK, NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-36" \
+            "build-tools;34.0.0" \
+            "build-tools;35.0.0" \
+            "ndk;$ANDROID_NDK_VERSION" \
+            "cmake;$ANDROID_CMAKE_VERSION"
+
+      - name: Install ccache
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ccache >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y ccache
+          fi
+          ccache --version
+
+      - name: Restore ccache (likely empty on first run)
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: operit-ccache-bench-v1-${{ runner.os }}-${{ runner.arch }}-ndk${{ env.ANDROID_NDK_VERSION }}-${{ github.run_id }}
+          restore-keys: |
+            operit-ccache-bench-v1-${{ runner.os }}-${{ runner.arch }}-ndk${{ env.ANDROID_NDK_VERSION }}-
+
+      - name: Reset ccache statistics
+        run: ccache --zero-stats
+
+      - name: Restore Android dependency cache
+        id: cache-manual-deps
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: source/${{ env.MANUAL_DEPS_DIR }}
+          key: android-full-deps-${{ runner.os }}-${{ hashFiles('source/ci/script/download_android_dependencies.sh', 'source/ci/script/prepare_android_dependencies.py') }}
+
+      - name: Download Android dependencies
+        if: steps.cache-manual-deps.outputs.cache-hit != 'true'
+        run: bash ci/script/download_android_dependencies.sh full "$MANUAL_DEPS_DIR"
+
+      - name: Prepare Android dependencies
+        run: |
+          python3 ci/script/prepare_android_dependencies.py \
+            --profile full \
+            --archives "$MANUAL_DEPS_DIR" \
+            --repository "$GITHUB_WORKSPACE/source"
+
+      - name: Restore native ripgrep cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            source/tools/native_ripgrep/target
+          key: native-ripgrep-arm64-${{ runner.os }}-${{ hashFiles('source/tools/native_ripgrep/Cargo.lock') }}
+
+      - name: Build native ripgrep
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup target add --toolchain 1.88.0 aarch64-linux-android
+          cargo +1.88.0 build \
+            --manifest-path tools/native_ripgrep/Cargo.toml \
+            --release \
+            --target aarch64-linux-android \
+            --locked
+          install -Dm755 \
+            tools/native_ripgrep/target/aarch64-linux-android/release/liboperit_ripgrep.so \
+            app/src/main/jniLibs/arm64-v8a/liboperit_ripgrep.so
+          test -s app/src/main/jniLibs/arm64-v8a/liboperit_ripgrep.so
+
+      - name: Install JavaScript dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g pnpm@10.34.5
+          npm ci --no-audit --no-fund
+          npm --prefix web-chat ci --no-audit --no-fund
+
+      - name: Build WebChat assets
+        run: |
+          npm --prefix web-chat run typecheck
+          npm run build:webchat
+
+      - name: Build bundled ToolPkg packages
+        run: |
+          npm run build:examples:github
+          git diff --exit-code -- examples/github.js
+          python3 tools/example_packages/sync_example_packages.py --no-hot-reload
+
+      - name: Configure local.properties (no release signing needed for benchmark)
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          {
+            echo "sdk.dir=$ANDROID_HOME"
+            echo 'GITHUB_CLIENT_ID='
+            echo 'GITHUB_CLIENT_SECRET='
+          } > local.properties
+
+      - name: Build development APK (cold)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon
+
+      - name: ccache statistics (cold)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '===== ccache --show-stats --verbose ====='
+          ccache --show-stats --verbose || ccache --show-stats || true
+
+      - name: Upload ccache stats artifact
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ccache-stats"
+          ccache --show-stats --verbose > "$RUNNER_TEMP/ccache-stats/ccache-cold.txt" 2>&1 || true
+          {
+            echo "pass: cold"
+            echo "source_sha: ${{ needs.resolve-source.outputs.source_sha }}"
+            echo "ndk: $ANDROID_NDK_VERSION"
+          } > "$RUNNER_TEMP/ccache-stats/meta-cold.txt"
+
+      - name: Upload stats artifact
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ccache-stats-cold
+          path: ${{ runner.temp }}/ccache-stats/
+          if-no-files-found: warn
+          retention-days: 14
+
+  warm-build:
+    name: Warm build (pass 2, measures ccache hit rate)
+    needs: [resolve-source, cold-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - name: Checkout Operit source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: CATMIAOZHI/Operit
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Initialize terminal submodule
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule sync -- terminal
+          git submodule update --init --recursive --depth 1 terminal
+          git submodule status -- terminal
+
+      - name: Set up JDK
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+
+      - name: Install Android SDK, NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-36" \
+            "build-tools;34.0.0" \
+            "build-tools;35.0.0" \
+            "ndk;$ANDROID_NDK_VERSION" \
+            "cmake;$ANDROID_CMAKE_VERSION"
+
+      - name: Install ccache
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ccache >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y ccache
+          fi
+          ccache --version
+
+      - name: Restore ccache (populated by cold-build)
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: operit-ccache-bench-v1-${{ runner.os }}-${{ runner.arch }}-ndk${{ env.ANDROID_NDK_VERSION }}-${{ github.run_id }}
+          restore-keys: |
+            operit-ccache-bench-v1-${{ runner.os }}-${{ runner.arch }}-ndk${{ env.ANDROID_NDK_VERSION }}-
+
+      - name: Reset ccache statistics
+        run: ccache --zero-stats
+
+      - name: Restore Android dependency cache
+        id: cache-manual-deps
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: source/${{ env.MANUAL_DEPS_DIR }}
+          key: android-full-deps-${{ runner.os }}-${{ hashFiles('source/ci/script/download_android_dependencies.sh', 'source/ci/script/prepare_android_dependencies.py') }}
+
+      - name: Download Android dependencies
+        if: steps.cache-manual-deps.outputs.cache-hit != 'true'
+        run: bash ci/script/download_android_dependencies.sh full "$MANUAL_DEPS_DIR"
+
+      - name: Prepare Android dependencies
+        run: |
+          python3 ci/script/prepare_android_dependencies.py \
+            --profile full \
+            --archives "$MANUAL_DEPS_DIR" \
+            --repository "$GITHUB_WORKSPACE/source"
+
+      - name: Restore native ripgrep cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            source/tools/native_ripgrep/target
+          key: native-ripgrep-arm64-${{ runner.os }}-${{ hashFiles('source/tools/native_ripgrep/Cargo.lock') }}
+
+      - name: Build native ripgrep
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup target add --toolchain 1.88.0 aarch64-linux-android
+          cargo +1.88.0 build \
+            --manifest-path tools/native_ripgrep/Cargo.toml \
+            --release \
+            --target aarch64-linux-android \
+            --locked
+          install -Dm755 \
+            tools/native_ripgrep/target/aarch64-linux-android/release/liboperit_ripgrep.so \
+            app/src/main/jniLibs/arm64-v8a/liboperit_ripgrep.so
+          test -s app/src/main/jniLibs/arm64-v8a/liboperit_ripgrep.so
+
+      - name: Install JavaScript dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g pnpm@10.34.5
+          npm ci --no-audit --no-fund
+          npm --prefix web-chat ci --no-audit --no-fund
+
+      - name: Build WebChat assets
+        run: |
+          npm --prefix web-chat run typecheck
+          npm run build:webchat
+
+      - name: Build bundled ToolPkg packages
+        run: |
+          npm run build:examples:github
+          git diff --exit-code -- examples/github.js
+          python3 tools/example_packages/sync_example_packages.py --no-hot-reload
+
+      - name: Configure local.properties (no release signing needed for benchmark)
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          {
+            echo "sdk.dir=$ANDROID_HOME"
+            echo 'GITHUB_CLIENT_ID='
+            echo 'GITHUB_CLIENT_SECRET='
+          } > local.properties
+
+      - name: Build development APK (warm)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon
+
+      - name: ccache statistics (warm)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '===== ccache --show-stats --verbose ====='
+          ccache --show-stats --verbose || ccache --show-stats || true
+
+      - name: Verify compiler launcher applied
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '===== CMake launcher verification ====='
+          found=0
+          while IFS= read -r -d '' f; do
+            if grep -Eq 'CMAKE_CXX_COMPILER_LAUNCHER:FILEPATH=.*ccache' "$f"; then
+              echo "launcher OK: $f"
+              found=1
+            fi
+          done < <(find .cxx -name CMakeCache.txt -print0 2>/dev/null)
+          if [[ "$found" -eq 0 ]]; then
+            echo '::warning::No CMakeCache.txt contained a ccache launcher entry.'
+          fi
+
+      - name: Upload ccache stats artifact
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ccache-stats"
+          ccache --show-stats --verbose > "$RUNNER_TEMP/ccache-stats/ccache-warm.txt" 2>&1 || true
+          {
+            echo "pass: warm"
+            echo "source_sha: ${{ needs.resolve-source.outputs.source_sha }}"
+            echo "ndk: $ANDROID_NDK_VERSION"
+          } > "$RUNNER_TEMP/ccache-stats/meta-warm.txt"
+
+      - name: Upload stats artifact
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ccache-stats-warm
+          path: ${{ runner.temp }}/ccache-stats/
+          if-no-files-found: warn
+          retention-days: 14
