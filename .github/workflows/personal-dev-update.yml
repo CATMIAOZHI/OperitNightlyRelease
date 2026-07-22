@@ -302,6 +302,38 @@ jobs:
           chmod +x ./gradlew
           ./gradlew :app:assembleDebug --stacktrace --no-daemon
 
+      - name: Run unit tests and lint
+        id: dev-checks
+        continue-on-error: true
+        shell: bash
+        run: |
+          ./gradlew :app:testDebugUnitTest :app:lintDebug --continue --stacktrace --no-daemon
+
+      - name: Upload test and lint reports
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: operit-ry-dev-reports-${{ github.run_number }}
+          path: source/app/build/reports/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Report check results
+        if: always()
+        shell: bash
+        run: |
+          outcome="${{ steps.dev-checks.outcome }}"
+          {
+            echo "## Development checks"
+            echo ""
+            echo "| Check | Outcome |"
+            echo "| --- | --- |"
+            echo "| Unit tests + Lint | $outcome |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$outcome" == "failure" ]]; then
+            echo "::warning::Unit tests or lint failed. Download the reports artifact to review."
+          fi
+
       - name: ccache statistics
         shell: bash
         run: ccache --show-stats --verbose || ccache --show-stats || true
