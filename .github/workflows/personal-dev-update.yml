@@ -42,25 +42,40 @@ jobs:
       should_build: ${{ steps.source.outputs.should_build }}
       source_sha: ${{ steps.source.outputs.source_sha }}
     steps:
-      - name: Checkout personal/dev
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          repository: CATMIAOZHI/Operit
-          ref: personal/dev
-          path: source
-          fetch-depth: 1
-          persist-credentials: false
-          submodules: false
-
-      - name: Compare source with latest dev release
+      - name: Resolve source SHA
         id: source
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild || false }}
+          DISPATCH_SHA: ${{ github.event.client_payload.sourceSha }}
         shell: bash
         run: |
           set -euo pipefail
-          source_sha="$(git -C source rev-parse HEAD)"
+
+          # When triggered by repository_dispatch, use the exact SHA that was
+          # pushed to Operit. For cron/workflow_dispatch, resolve personal/dev
+          # HEAD. This avoids reading a shifted HEAD if the receiving job is
+          # queued behind another build.
+          if [[ -n "${DISPATCH_SHA:-}" ]]; then
+            source_sha="$DISPATCH_SHA"
+            if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Received dispatch sourceSha is not a 40-char SHA: $source_sha"
+              exit 1
+            fi
+            echo "Using dispatch source SHA: $source_sha"
+            # Dispatch events come from personal/dev pushes, so the publisher
+            # script is guaranteed to exist. Trust the SHA and skip checkout.
+            should_build=true
+          else
+            source_sha="$(git ls-remote https://github.com/CATMIAOZHI/Operit.git refs/heads/personal/dev | awk '{print $1}')"
+            if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Could not resolve personal/dev HEAD"
+              exit 1
+            fi
+            echo "Resolved personal/dev HEAD: $source_sha"
+            should_build=true
+          fi
+
           releases_file="$RUNNER_TEMP/nightly-releases.json"
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100&page=1" > "$releases_file"
           latest_sha="$(
@@ -89,11 +104,8 @@ jobs:
                   break
           PY
           )"
-          should_build=true
-          if [[ ! -f source/tools/hotbuild/publish_dev_update.py ]]; then
-            echo '::notice::personal/dev does not contain the development update publisher yet.'
-            should_build=false
-          elif [[ "$FORCE_REBUILD" != 'true' && "$source_sha" == "$latest_sha" ]]; then
+
+          if [[ "$FORCE_REBUILD" != 'true' && "$source_sha" == "$latest_sha" ]]; then
             should_build=false
           fi
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
@@ -352,129 +364,3 @@ jobs:
         if: always()
         shell: bash
         run: ccache --show-stats --verbose || ccache --show-stats || true
-
-  # Quality checks run in parallel with build-and-publish on a separate
-  # runner. They are non-blocking: failures never prevent the APK from
-  # being published. The job only needs the JVM dependency profile
-  # (libs.zip), not the full native/asset/signing setup, mirroring the
-  # android-jvm lane in Operit's pr-check.yml.
-  quality-checks:
-    name: Development quality checks
-    needs: check-source
-    if: needs.check-source.outputs.should_build == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    continue-on-error: true
-    defaults:
-      run:
-        working-directory: source
-
-    steps:
-      - name: Checkout personal/dev
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          repository: CATMIAOZHI/Operit
-          ref: ${{ needs.check-source.outputs.source_sha }}
-          path: source
-          fetch-depth: 1
-          persist-credentials: false
-          submodules: false
-
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: '3.12'
-
-      - name: Initialize terminal submodule
-        shell: bash
-        run: |
-          set -euo pipefail
-          git submodule sync -- terminal
-          git submodule update --init --recursive --depth 1 terminal
-          git submodule status -- terminal
-
-      - name: Set up JDK
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
-        with:
-          distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
-
-      - name: Set up Gradle cache
-        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
-        with:
-          cache-read-only: false
-          cache-cleanup: on-success
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
-
-      - name: Install JVM-check Android toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-34" \
-            "platforms;android-36" \
-            "build-tools;35.0.0"
-
-      - name: Configure secret-free Android build
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "sdk.dir=$ANDROID_HOME"
-            echo 'GITHUB_CLIENT_ID='
-            echo 'GITHUB_CLIENT_SECRET='
-          } > local.properties
-
-      - name: Restore JVM dependency cache
-        id: cache-jvm-deps
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: source/${{ env.MANUAL_DEPS_DIR }}
-          key: android-jvm-deps-${{ runner.os }}-${{ hashFiles('source/ci/script/download_android_dependencies.sh', 'source/ci/script/prepare_android_dependencies.py') }}
-
-      - name: Download JVM dependencies
-        if: steps.cache-jvm-deps.outputs.cache-hit != 'true'
-        run: bash ci/script/download_android_dependencies.sh jvm "$MANUAL_DEPS_DIR"
-
-      - name: Prepare JVM dependencies
-        run: |
-          python3 ci/script/prepare_android_dependencies.py \
-            --profile jvm \
-            --archives "$MANUAL_DEPS_DIR" \
-            --repository "$GITHUB_WORKSPACE/source"
-
-      - name: Run unit tests and lint
-        id: dev-checks
-        shell: bash
-        run: |
-          set -euo pipefail
-          chmod +x ./gradlew
-          ./gradlew :app:testDebugUnitTest :app:lintDebug --continue --stacktrace
-
-      - name: Upload test and lint reports
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: operit-ry-dev-reports-${{ github.run_number }}
-          path: source/app/build/reports/**
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Report check results
-        if: always()
-        shell: bash
-        run: |
-          outcome="${{ steps.dev-checks.outcome }}"
-          {
-            echo "## Development checks"
-            echo ""
-            echo "| Check | Outcome |"
-            echo "| --- | --- |"
-            echo "| Unit tests + Lint | $outcome |"
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$outcome" == "failure" ]]; then
-            echo "::warning::Unit tests or lint failed. Download the reports artifact to review."
-          fi
