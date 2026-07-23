@@ -33,15 +33,6 @@ env:
   ANDROID_CMAKE_VERSION: '3.22.1'
   MANUAL_DEPS_DIR: manual-deps
   OPERIT_RELEASE_CERT_SHA256: '40:F8:7A:4D:66:EB:70:D0:E2:D1:37:9C:6A:97:DD:DC:0C:ED:D3:BA:87:2E:02:74:50:CA:77:AF:42:EC:5E:74'
-  # ccache configuration. CCACHE_COMPILERCHECK=content is essential: the NDK is
-  # reinstalled fresh each run, so default mtime-based checks cause universal
-  # cache misses. Keying by content makes hits stable across NDK reinstalls.
-  CCACHE_DIR: ${{ github.workspace }}/.ccache
-  CCACHE_MAXSIZE: 2G
-  CCACHE_BASEDIR: ${{ github.workspace }}/source
-  CCACHE_COMPILERCHECK: content
-  CMAKE_C_COMPILER_LAUNCHER: ccache
-  CMAKE_CXX_COMPILER_LAUNCHER: ccache
 
 jobs:
   check-source:
@@ -116,6 +107,15 @@ jobs:
     timeout-minutes: 240
     env:
       OPERIT_DEV_BUILD_NUMBER: ${{ github.run_number }}
+      # ccache configuration. CCACHE_COMPILERCHECK=content is essential: the NDK is
+      # reinstalled fresh each run, so default mtime-based checks cause universal
+      # cache misses. Keying by content makes hits stable across NDK reinstalls.
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_BASEDIR: ${{ github.workspace }}/source
+      CCACHE_COMPILERCHECK: content
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
     defaults:
       run:
         working-directory: source
