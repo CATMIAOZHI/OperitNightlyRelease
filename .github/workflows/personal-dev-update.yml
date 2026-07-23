@@ -1,8 +1,16 @@
 name: Personal Dev Update
 
 on:
+  repository_dispatch:
+    types:
+      - personal-dev-updated
   schedule:
-    - cron: '*/5 * * * *'
+    # Hourly fallback. GitHub Actions does not guarantee on-time or even
+    # on-frequency delivery for scheduled workflows, and `*/5 * * * *` was
+    # observed to be dropped down to roughly once per hour during peak load.
+    # Push-driven `repository_dispatch` is the primary trigger; this cron only
+    # covers pushes that missed the dispatch event.
+    - cron: '7 * * * *'
   workflow_dispatch:
     inputs:
       force_rebuild:
