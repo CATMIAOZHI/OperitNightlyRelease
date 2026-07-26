@@ -4,13 +4,6 @@ on:
   repository_dispatch:
     types:
       - personal-dev-updated
-  schedule:
-    # Hourly fallback. GitHub Actions does not guarantee on-time or even
-    # on-frequency delivery for scheduled workflows, and `*/5 * * * *` was
-    # observed to be dropped down to roughly once per hour during peak load.
-    # Push-driven `repository_dispatch` is the primary trigger; this cron only
-    # covers pushes that missed the dispatch event.
-    - cron: '7 * * * *'
   workflow_dispatch:
     inputs:
       force_rebuild:
@@ -53,9 +46,9 @@ jobs:
           set -euo pipefail
 
           # When triggered by repository_dispatch, use the exact SHA that was
-          # pushed to Operit. For cron/workflow_dispatch, resolve personal/dev
-          # HEAD. This avoids reading a shifted HEAD if the receiving job is
-          # queued behind another build.
+          # pushed to Operit. For workflow_dispatch, resolve personal/dev HEAD.
+          # This avoids reading a shifted HEAD if the receiving job is queued
+          # behind another build.
           if [[ -n "${DISPATCH_SHA:-}" ]]; then
             source_sha="$DISPATCH_SHA"
             if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
