@@ -263,9 +263,11 @@ jobs:
           path = pathlib.Path("app/build.gradle.kts")
           text = path.read_text(encoding="utf-8")
           text, code_count = re.subn(
-              r"(versionCode\s*=\s*devBuildNumber\?\.let\s*\{\s*100_000\s*\+\s*it\s*\}\s*\?:\s*)\d+",
+              r"(^\s*versionCode\s*=\s*)\d+\s*$",
               rf"\g<1>{os.environ['VERSION_CODE']}",
               text,
+              count=1,
+              flags=re.MULTILINE,
           )
           text, name_count = re.subn(
               r'versionName\s*=\s*"[^"]+"',
@@ -280,7 +282,7 @@ jobs:
           path.write_text(text, encoding="utf-8")
           PY
           grep -F "versionName = \"$VERSION_NAME\"" app/build.gradle.kts
-          grep -E "versionCode.*\\?:[[:space:]]*$VERSION_CODE" app/build.gradle.kts
+          grep -E "versionCode[[:space:]]*=[[:space:]]*$VERSION_CODE" app/build.gradle.kts
 
       - name: Configure identical Operit Ry signing
         env:
