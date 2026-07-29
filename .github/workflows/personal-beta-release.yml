@@ -383,6 +383,7 @@ jobs:
           BASE_TAG: ${{ inputs.base_tag }}
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ needs.resolve-source.outputs.source_sha }}
+          VERSION_CODE: ${{ inputs.version_code }}
           VERSION_NAME: ${{ inputs.version_name }}
         shell: bash
         run: |
@@ -419,12 +420,148 @@ jobs:
             --to-patch-index "$target_patch" \
             --repo "$GITHUB_REPOSITORY" \
             --tag "v$VERSION_NAME" \
-            --channel personal-beta \
-            --application-id com.rainy.operitry \
-            --version-label "$VERSION_NAME" \
-            --series "$target_version+$target_patch" \
-            --source-sha "$SOURCE_SHA" \
-            --extra-asset "$target_apk"
+            --no-publish
+
+          mapfile -t meta_files < <(find . -maxdepth 1 -type f -name 'patch_*.json')
+          if (( ${#meta_files[@]} != 1 )); then
+            echo "::error::Expected exactly one generated patch metadata file, found ${#meta_files[@]}"
+            exit 1
+          fi
+          meta_file="${meta_files[0]}"
+          release_notes="$RUNNER_TEMP/personal-beta-release.json"
+          patch_file="$(
+            python3 - "$meta_file" "$release_notes" "$SOURCE_SHA" "$VERSION_CODE" "$VERSION_NAME" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          meta_path = pathlib.Path(sys.argv[1])
+          release_notes_path = pathlib.Path(sys.argv[2])
+          source_sha = sys.argv[3]
+          version_code = int(sys.argv[4])
+          version_name = sys.argv[5]
+
+          metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+          metadata.update(
+              {
+                  "channel": "personal-beta",
+                  "applicationId": "com.rainy.operitry",
+                  "version": version_name,
+                  "versionCode": version_code,
+                  "series": f"{metadata['toVersion']}+{metadata['toPatchIndex']}",
+                  "sourceSha": source_sha,
+              }
+          )
+          meta_path.write_text(
+              json.dumps(metadata, indent=2, sort_keys=True),
+              encoding="utf-8",
+          )
+          release_metadata = {
+              key: metadata.get(key)
+              for key in (
+                  "format",
+                  "tag",
+                  "fromVersion",
+                  "toVersion",
+                  "fromPatchIndex",
+                  "toPatchIndex",
+                  "baseSha256",
+                  "targetSha256",
+                  "patchFile",
+                  "patchSha256",
+                  "createdAt",
+                  "channel",
+                  "applicationId",
+                  "version",
+                  "versionCode",
+                  "series",
+                  "sourceSha",
+              )
+          }
+          release_metadata["metaFile"] = meta_path.name
+          release_notes_path.write_text(
+              json.dumps(release_metadata, indent=2, sort_keys=True),
+              encoding="utf-8",
+          )
+          print(metadata["patchFile"])
+          PY
+          )"
+          test -s "$patch_file"
+          test -s "$meta_file"
+          test -s "$release_notes"
+
+          release_apk="Operit-Ry-v$VERSION_NAME.apk"
+          cp "$target_apk" "$release_apk"
+
+          release_tag="v$VERSION_NAME"
+          draft_created=false
+          cleanup_draft() {
+            if [[ "$draft_created" == true ]]; then
+              gh release delete "$release_tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --cleanup-tag \
+                --yes || true
+            fi
+          }
+          trap cleanup_draft ERR
+
+          gh release create "v$VERSION_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Operit Ry $VERSION_NAME Beta" \
+            --notes-file "$release_notes" \
+            --draft
+          draft_created=true
+
+          gh release upload "$release_tag" \
+            "$patch_file" \
+            "$meta_file" \
+            "$release_apk" \
+            --repo "$GITHUB_REPOSITORY"
+
+          release_state="$RUNNER_TEMP/personal-beta-draft.json"
+          gh release view "$release_tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,body,assets > "$release_state"
+          python3 - "$release_state" "$release_notes" "$patch_file" "$meta_file" "$release_apk" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          state = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected_body = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+          expected_assets = {pathlib.Path(value).name for value in sys.argv[3:]}
+          actual_assets = {asset["name"] for asset in state["assets"]}
+
+          if not state["isDraft"] or state["isPrerelease"]:
+              raise SystemExit("Release must remain a non-prerelease draft during verification")
+          if json.loads(state["body"]) != expected_body:
+              raise SystemExit("Draft release body does not match generated metadata")
+          if actual_assets != expected_assets:
+              raise SystemExit(
+                  f"Draft assets mismatch: expected={sorted(expected_assets)} "
+                  f"actual={sorted(actual_assets)}"
+              )
+          PY
+
+          gh release edit "$release_tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease
+          draft_created=false
+          trap - ERR
+
+          gh release view "v$VERSION_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,assets \
+            --jq '[
+              .tagName,
+              .isDraft,
+              .isPrerelease,
+              ([.assets[].name | select(endswith(".apk"))] | length),
+              ([.assets[].name | select(startswith("apkrawpatch_") and endswith(".zip"))] | length),
+              ([.assets[].name | select(startswith("patch_") and endswith(".json"))] | length)
+            ] | @tsv'
 
       - name: Upload beta APK artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
