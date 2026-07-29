@@ -1,0 +1,438 @@
+name: Personal Beta Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: Stable Operit Ry tag used as the differential-update base
+        required: true
+        default: v1.12.0+4-ry.1
+        type: string
+      version_name:
+        description: Beta APK version name and NightlyRelease tag
+        required: true
+        default: 1.12.0+4-ry.2
+        type: string
+      version_code:
+        description: Beta APK version code; must be newer than the base APK
+        required: true
+        default: '45'
+        type: string
+
+concurrency:
+  group: personal-beta-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  JAVA_VERSION: '21'
+  NODE_VERSION: '22'
+  ANDROID_NDK_VERSION: '25.1.8937393'
+  ANDROID_CMAKE_VERSION: '3.22.1'
+  MANUAL_DEPS_DIR: manual-deps
+  OPERIT_RELEASE_CERT_SHA256: '40:F8:7A:4D:66:EB:70:D0:E2:D1:37:9C:6A:97:DD:DC:0C:ED:D3:BA:87:2E:02:74:50:CA:77:AF:42:EC:5E:74'
+
+jobs:
+  resolve-source:
+    name: Resolve personal/main source
+    runs-on: ubuntu-24.04
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - name: Validate inputs and resolve personal/main
+        id: source
+        env:
+          BASE_TAG: ${{ inputs.base_tag }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_CODE: ${{ inputs.version_code }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import re
+
+          base_tag = os.environ["BASE_TAG"]
+          version_name = os.environ["VERSION_NAME"]
+          version_code = os.environ["VERSION_CODE"]
+          pattern = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)\+(\d+)-ry\.(\d+)$")
+          base = pattern.fullmatch(base_tag)
+          target = pattern.fullmatch(version_name)
+          if base is None:
+              raise SystemExit(f"Invalid stable base tag: {base_tag}")
+          if target is None:
+              raise SystemExit(f"Invalid beta version name: {version_name}")
+          base_numbers = tuple(map(int, base.groups()))
+          target_numbers = tuple(map(int, target.groups()))
+          if base_numbers[:3] != target_numbers[:3]:
+              raise SystemExit("Beta and base must share the same x.y.z version")
+          if target_numbers <= base_numbers:
+              raise SystemExit("Beta version must compare newer than the stable base")
+          if not version_code.isdigit() or not 1 <= int(version_code) <= 2_100_000_000:
+              raise SystemExit(f"Invalid Android version code: {version_code}")
+          PY
+
+          tag="v$VERSION_NAME"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $tag already exists; beta releases are immutable."
+            exit 1
+          fi
+
+          source_sha="$(
+            git ls-remote https://github.com/CATMIAOZHI/Operit.git refs/heads/personal/main |
+              awk '{print $1}'
+          )"
+          if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve personal/main HEAD"
+            exit 1
+          fi
+          echo "Resolved personal/main HEAD: $source_sha"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+
+  build-and-publish:
+    name: Build and publish formal-app beta
+    needs: resolve-source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_BASEDIR: ${{ github.workspace }}/source
+      CCACHE_COMPILERCHECK: content
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+    defaults:
+      run:
+        working-directory: source
+
+    steps:
+      - name: Checkout exact personal/main source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: CATMIAOZHI/Operit
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Initialize terminal submodule
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule sync -- terminal
+          git submodule update --init --recursive --depth 1 terminal
+          git submodule status -- terminal
+
+      - name: Set up JDK
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+        with:
+          cache-read-only: false
+          cache-cleanup: on-success
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+
+      - name: Install Android SDK, NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-36" \
+            "build-tools;34.0.0" \
+            "build-tools;35.0.0" \
+            "ndk;$ANDROID_NDK_VERSION" \
+            "cmake;$ANDROID_CMAKE_VERSION"
+
+      - name: Install ccache
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ccache >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y ccache
+          fi
+          ccache --version
+
+      - name: Restore ccache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: operit-beta-ccache-v1-${{ runner.os }}-${{ runner.arch }}-ndk${{ env.ANDROID_NDK_VERSION }}-${{ github.run_id }}
+          restore-keys: |
+            operit-beta-ccache-v1-${{ runner.os }}-${{ runner.arch }}-ndk${{ env.ANDROID_NDK_VERSION }}-
+
+      - name: Restore Android dependency cache
+        id: cache-manual-deps
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: source/${{ env.MANUAL_DEPS_DIR }}
+          key: android-full-deps-${{ runner.os }}-${{ hashFiles('source/ci/script/download_android_dependencies.sh', 'source/ci/script/prepare_android_dependencies.py') }}
+
+      - name: Download Android dependencies
+        if: steps.cache-manual-deps.outputs.cache-hit != 'true'
+        run: bash ci/script/download_android_dependencies.sh full "$MANUAL_DEPS_DIR"
+
+      - name: Prepare Android dependencies
+        run: |
+          python3 ci/script/prepare_android_dependencies.py \
+            --profile full \
+            --archives "$MANUAL_DEPS_DIR" \
+            --repository "$GITHUB_WORKSPACE/source"
+
+      - name: Restore native ripgrep cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            source/tools/native_ripgrep/target
+          key: native-ripgrep-arm64-${{ runner.os }}-${{ hashFiles('source/tools/native_ripgrep/Cargo.lock') }}
+
+      - name: Build native ripgrep
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup target add --toolchain 1.88.0 aarch64-linux-android
+          cargo +1.88.0 build \
+            --manifest-path tools/native_ripgrep/Cargo.toml \
+            --release \
+            --target aarch64-linux-android \
+            --locked
+          install -Dm755 \
+            tools/native_ripgrep/target/aarch64-linux-android/release/liboperit_ripgrep.so \
+            app/src/main/jniLibs/arm64-v8a/liboperit_ripgrep.so
+          test -s app/src/main/jniLibs/arm64-v8a/liboperit_ripgrep.so
+
+      - name: Install JavaScript dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g pnpm@10.34.5
+          npm ci --no-audit --no-fund
+          npm --prefix web-chat ci --no-audit --no-fund
+
+      - name: Build WebChat assets
+        run: |
+          npm --prefix web-chat run typecheck
+          npm run build:webchat
+
+      - name: Build bundled ToolPkg packages
+        run: |
+          npm run build:examples:github
+          git diff --exit-code -- examples/github.js
+          python3 tools/example_packages/sync_example_packages.py --no-hot-reload
+
+      - name: Override beta version in the ephemeral checkout
+        env:
+          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_CODE: ${{ inputs.version_code }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          path = pathlib.Path("app/build.gradle.kts")
+          text = path.read_text(encoding="utf-8")
+          text, code_count = re.subn(
+              r"(versionCode\s*=\s*devBuildNumber\?\.let\s*\{\s*100_000\s*\+\s*it\s*\}\s*\?:\s*)\d+",
+              rf"\g<1>{os.environ['VERSION_CODE']}",
+              text,
+          )
+          text, name_count = re.subn(
+              r'versionName\s*=\s*"[^"]+"',
+              f'versionName = "{os.environ["VERSION_NAME"]}"',
+              text,
+              count=1,
+          )
+          if code_count != 1 or name_count != 1:
+              raise SystemExit(
+                  f"Expected one versionCode and versionName replacement; got {code_count} and {name_count}"
+              )
+          path.write_text(text, encoding="utf-8")
+          PY
+          grep -F "versionName = \"$VERSION_NAME\"" app/build.gradle.kts
+          grep -E "versionCode.*\\?:[[:space:]]*$VERSION_CODE" app/build.gradle.kts
+
+      - name: Configure identical Operit Ry signing
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.OPERIT_RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.OPERIT_RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.OPERIT_RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.OPERIT_RELEASE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${RELEASE_KEYSTORE_BASE64:?OPERIT_RELEASE_KEYSTORE_BASE64 is required}"
+          : "${RELEASE_STORE_PASSWORD:?OPERIT_RELEASE_STORE_PASSWORD is required}"
+          : "${RELEASE_KEY_ALIAS:?OPERIT_RELEASE_KEY_ALIAS is required}"
+          : "${RELEASE_KEY_PASSWORD:?OPERIT_RELEASE_KEY_PASSWORD is required}"
+
+          release_keystore="$RUNNER_TEMP/operit-ry-release.jks"
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$release_keystore"
+          chmod 600 "$release_keystore"
+
+          actual_cert_sha256="$(
+            keytool -list -v \
+              -keystore "$release_keystore" \
+              -storepass "$RELEASE_STORE_PASSWORD" \
+              -alias "$RELEASE_KEY_ALIAS" |
+              sed -n 's/^[[:space:]]*SHA256: //p'
+          )"
+          if [[ "$actual_cert_sha256" != "$OPERIT_RELEASE_CERT_SHA256" ]]; then
+            echo "Signing certificate does not match the existing Operit Ry release." >&2
+            exit 1
+          fi
+
+          umask 077
+          {
+            echo "sdk.dir=$ANDROID_HOME"
+            echo 'GITHUB_CLIENT_ID='
+            echo 'GITHUB_CLIENT_SECRET='
+            echo "RELEASE_STORE_FILE=$release_keystore"
+            echo "RELEASE_STORE_PASSWORD=$RELEASE_STORE_PASSWORD"
+            echo "RELEASE_KEY_ALIAS=$RELEASE_KEY_ALIAS"
+            echo "RELEASE_KEY_PASSWORD=$RELEASE_KEY_PASSWORD"
+          } > local.properties
+
+      - name: Build formal-identity beta APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew :app:assembleNightly --stacktrace
+
+      - name: Verify APK identity, version and signature
+        env:
+          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_CODE: ${{ inputs.version_code }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk='app/build/outputs/apk/nightly/app-nightly.apk'
+          test -s "$apk"
+          analyzer="$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer"
+          test "$("$analyzer" manifest application-id "$apk")" = 'com.rainy.operitry'
+          test "$("$analyzer" manifest version-name "$apk")" = "$VERSION_NAME"
+          test "$("$analyzer" manifest version-code "$apk")" = "$VERSION_CODE"
+          expected_digest="${OPERIT_RELEASE_CERT_SHA256//:/}"
+          expected_digest="${expected_digest,,}"
+          certificate="$($ANDROID_HOME/build-tools/35.0.0/apksigner verify --print-certs "$apk")"
+          grep -Fqi "Signer #1 certificate SHA-256 digest: $expected_digest" <<< "$certificate"
+
+      - name: Download and verify stable base APK
+        env:
+          BASE_TAG: ${{ inputs.base_tag }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION_CODE: ${{ inputs.version_code }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_dir="$RUNNER_TEMP/base-apk"
+          mkdir -p "$base_dir"
+          gh release download "$BASE_TAG" \
+            --repo CATMIAOZHI/Operit \
+            --pattern '*.apk' \
+            --dir "$base_dir"
+          mapfile -t base_apks < <(find "$base_dir" -maxdepth 1 -type f -name '*.apk')
+          if (( ${#base_apks[@]} != 1 )); then
+            echo "::error::Expected exactly one base APK, found ${#base_apks[@]}"
+            exit 1
+          fi
+          analyzer="$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer"
+          test "$("$analyzer" manifest application-id "${base_apks[0]}")" = 'com.rainy.operitry'
+          base_code="$("$analyzer" manifest version-code "${base_apks[0]}")"
+          if (( VERSION_CODE <= base_code )); then
+            echo "::error::Beta versionCode $VERSION_CODE must be newer than base versionCode $base_code"
+            exit 1
+          fi
+          cp "${base_apks[0]}" "$RUNNER_TEMP/base.apk"
+
+      - name: Build differential update and publish immutable prerelease
+        env:
+          BASE_TAG: ${{ inputs.base_tag }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.resolve-source.outputs.source_sha }}
+          VERSION_NAME: ${{ inputs.version_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_apk='app/build/outputs/apk/nightly/app-nightly.apk'
+          readarray -t version_parts < <(
+            python3 - "$BASE_TAG" "$VERSION_NAME" <<'PY'
+          import re
+          import sys
+
+          pattern = re.compile(r"^v?(\d+\.\d+\.\d+)\+(\d+)-ry\.(\d+)$")
+          for value in sys.argv[1:]:
+              match = pattern.fullmatch(value)
+              if match is None:
+                  raise SystemExit(f"Invalid version: {value}")
+              print(match.group(1))
+              print(match.group(2))
+          PY
+          )
+          base_version="${version_parts[0]}"
+          base_patch="${version_parts[1]}"
+          target_version="${version_parts[2]}"
+          target_patch="${version_parts[3]}"
+
+          cp "$RUNNER_TEMP/base.apk" tools/hotbuild/from-beta.apk
+          cp "$target_apk" tools/hotbuild/to-beta.apk
+          python3 tools/hotbuild/build_patch.py \
+            --from tools/hotbuild/from-beta.apk \
+            --to tools/hotbuild/to-beta.apk \
+            --format apkraw \
+            --from-version "$base_version" \
+            --from-patch-index "$base_patch" \
+            --to-version "$target_version" \
+            --to-patch-index "$target_patch" \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "v$VERSION_NAME" \
+            --channel personal-beta \
+            --application-id com.rainy.operitry \
+            --version-label "$VERSION_NAME" \
+            --series "$target_version+$target_patch" \
+            --source-sha "$SOURCE_SHA" \
+            --extra-asset "$target_apk"
+
+      - name: Upload beta APK artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: operit-ry-beta-${{ inputs.version_name }}
+          path: source/app/build/outputs/apk/nightly/app-nightly.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: ccache statistics
+        if: always()
+        shell: bash
+        run: ccache --show-stats --verbose || ccache --show-stats || true
