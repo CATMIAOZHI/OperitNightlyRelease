@@ -4,10 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       base_tag:
-        description: Stable Operit Ry tag used as the differential-update base
+        description: Stable Operit Ry tag used when base_mode is stable or for the first Beta in auto mode
         required: true
         default: v1.12.0+4-ry.1
         type: string
+      base_mode:
+        description: Select the differential base; auto chains later Betas from the previous NightlyRelease Beta
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - stable
       version_name:
         description: Beta APK version name and NightlyRelease tag
         required: true
@@ -40,13 +48,17 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       source_sha: ${{ steps.source.outputs.source_sha }}
+      base_tag: ${{ steps.source.outputs.base_tag }}
+      base_repository: ${{ steps.source.outputs.base_repository }}
     steps:
       - name: Validate inputs and resolve personal/main
         id: source
         env:
-          BASE_TAG: ${{ inputs.base_tag }}
+          BASE_MODE: ${{ inputs.base_mode }}
+          BASE_TAG_INPUT: ${{ inputs.base_tag }}
           VERSION_NAME: ${{ inputs.version_name }}
           VERSION_CODE: ${{ inputs.version_code }}
+          NIGHTLY_REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
@@ -56,24 +68,48 @@ jobs:
           import os
           import re
 
-          base_tag = os.environ["BASE_TAG"]
+          base_mode = os.environ["BASE_MODE"]
+          base_tag_input = os.environ["BASE_TAG_INPUT"]
           version_name = os.environ["VERSION_NAME"]
           version_code = os.environ["VERSION_CODE"]
+          nightly_repository = os.environ["NIGHTLY_REPOSITORY"]
           pattern = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)\+(\d+)-ry\.(\d+)$")
-          base = pattern.fullmatch(base_tag)
           target = pattern.fullmatch(version_name)
-          if base is None:
-              raise SystemExit(f"Invalid stable base tag: {base_tag}")
           if target is None:
               raise SystemExit(f"Invalid beta version name: {version_name}")
-          base_numbers = tuple(map(int, base.groups()))
+          if version_name.startswith("v"):
+              raise SystemExit("version_name must not include the leading v prefix")
           target_numbers = tuple(map(int, target.groups()))
+
+          if base_mode not in {"auto", "stable"}:
+              raise SystemExit(f"Invalid base mode: {base_mode}")
+
+          if base_mode == "auto" and target_numbers[4] > 2:
+              previous_revision = target_numbers[4] - 1
+              base_tag = (
+                  f"v{target_numbers[0]}.{target_numbers[1]}.{target_numbers[2]}"
+                  f"+{target_numbers[3]}-ry.{previous_revision}"
+              )
+              base_repository = nightly_repository
+          else:
+              base_tag = base_tag_input
+              base_repository = "CATMIAOZHI/Operit"
+
+          base = pattern.fullmatch(base_tag)
+          if base is None:
+              raise SystemExit(f"Invalid differential base tag: {base_tag}")
+          base_numbers = tuple(map(int, base.groups()))
           if base_numbers[:3] != target_numbers[:3]:
               raise SystemExit("Beta and base must share the same x.y.z version")
           if target_numbers <= base_numbers:
-              raise SystemExit("Beta version must compare newer than the stable base")
+              raise SystemExit("Beta version must compare newer than the differential base")
           if not version_code.isdigit() or not 1 <= int(version_code) <= 2_100_000_000:
               raise SystemExit(f"Invalid Android version code: {version_code}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"base_tag={base_tag}", file=output)
+              print(f"base_repository={base_repository}", file=output)
+          print(f"Resolved differential base: {base_repository}@{base_tag}")
           PY
 
           tag="v$VERSION_NAME"
@@ -350,9 +386,10 @@ jobs:
           certificate="$($ANDROID_HOME/build-tools/35.0.0/apksigner verify --print-certs "$apk")"
           grep -Fqi "Signer #1 certificate SHA-256 digest: $expected_digest" <<< "$certificate"
 
-      - name: Download and verify stable base APK
+      - name: Download and verify differential base APK
         env:
-          BASE_TAG: ${{ inputs.base_tag }}
+          BASE_TAG: ${{ needs.resolve-source.outputs.base_tag }}
+          BASE_REPOSITORY: ${{ needs.resolve-source.outputs.base_repository }}
           GH_TOKEN: ${{ github.token }}
           VERSION_CODE: ${{ inputs.version_code }}
         shell: bash
@@ -361,7 +398,7 @@ jobs:
           base_dir="$RUNNER_TEMP/base-apk"
           mkdir -p "$base_dir"
           gh release download "$BASE_TAG" \
-            --repo CATMIAOZHI/Operit \
+            --repo "$BASE_REPOSITORY" \
             --pattern '*.apk' \
             --dir "$base_dir"
           mapfile -t base_apks < <(find "$base_dir" -maxdepth 1 -type f -name '*.apk')
@@ -371,16 +408,21 @@ jobs:
           fi
           analyzer="$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer"
           test "$("$analyzer" manifest application-id "${base_apks[0]}")" = 'com.rainy.operitry'
+          test "$("$analyzer" manifest version-name "${base_apks[0]}")" = "${BASE_TAG#v}"
           base_code="$("$analyzer" manifest version-code "${base_apks[0]}")"
           if (( VERSION_CODE <= base_code )); then
             echo "::error::Beta versionCode $VERSION_CODE must be newer than base versionCode $base_code"
             exit 1
           fi
+          expected_digest="${OPERIT_RELEASE_CERT_SHA256//:/}"
+          expected_digest="${expected_digest,,}"
+          base_certificate="$($ANDROID_HOME/build-tools/35.0.0/apksigner verify --print-certs "${base_apks[0]}")"
+          grep -Fqi "Signer #1 certificate SHA-256 digest: $expected_digest" <<< "$base_certificate"
           cp "${base_apks[0]}" "$RUNNER_TEMP/base.apk"
 
       - name: Build differential update and publish immutable prerelease
         env:
-          BASE_TAG: ${{ inputs.base_tag }}
+          BASE_TAG: ${{ needs.resolve-source.outputs.base_tag }}
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ needs.resolve-source.outputs.source_sha }}
           VERSION_CODE: ${{ inputs.version_code }}
