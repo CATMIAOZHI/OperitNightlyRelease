@@ -24,7 +24,7 @@ env:
   JAVA_VERSION: '21'
   NODE_VERSION: '22'
   ANDROID_NDK_VERSION: '25.1.8937393'
-  ANDROID_CMAKE_VERSION: '3.22.1'
+  ANDROID_CMAKE_VERSION: '3.31.6'
   MANUAL_DEPS_DIR: manual-deps
   # ccache configuration under test.
   CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -130,9 +130,9 @@ jobs:
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: operit-ccache-bench-v1-${{ runner.os }}-${{ runner.arch }}-ndk${{ env.ANDROID_NDK_VERSION }}-${{ github.run_id }}
+          key: operit-ccache-bench-v1-${{ runner.os }}-${{ runner.arch }}-ndk${{ env.ANDROID_NDK_VERSION }}-cmake${{ env.ANDROID_CMAKE_VERSION }}-${{ github.run_id }}
           restore-keys: |
-            operit-ccache-bench-v1-${{ runner.os }}-${{ runner.arch }}-ndk${{ env.ANDROID_NDK_VERSION }}-
+            operit-ccache-bench-v1-${{ runner.os }}-${{ runner.arch }}-ndk${{ env.ANDROID_NDK_VERSION }}-cmake${{ env.ANDROID_CMAKE_VERSION }}-
 
       - name: Reset ccache statistics
         run: ccache --zero-stats
@@ -321,9 +321,9 @@ jobs:
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: operit-ccache-bench-v1-${{ runner.os }}-${{ runner.arch }}-ndk${{ env.ANDROID_NDK_VERSION }}-${{ github.run_id }}
+          key: operit-ccache-bench-v1-${{ runner.os }}-${{ runner.arch }}-ndk${{ env.ANDROID_NDK_VERSION }}-cmake${{ env.ANDROID_CMAKE_VERSION }}-${{ github.run_id }}
           restore-keys: |
-            operit-ccache-bench-v1-${{ runner.os }}-${{ runner.arch }}-ndk${{ env.ANDROID_NDK_VERSION }}-
+            operit-ccache-bench-v1-${{ runner.os }}-${{ runner.arch }}-ndk${{ env.ANDROID_NDK_VERSION }}-cmake${{ env.ANDROID_CMAKE_VERSION }}-
 
       - name: Reset ccache statistics
         run: ccache --zero-stats
