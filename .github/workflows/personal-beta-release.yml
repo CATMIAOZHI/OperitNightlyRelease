@@ -6,12 +6,12 @@ on:
       base_tag:
         description: Stable Operit Ry tag used when base_mode is stable or for the first Beta in auto mode
         required: true
-        default: v1.12.0+4-ry.1
+        default: v1.12.1-ry.2
         type: string
       base_mode:
         description: Select the differential base; auto chains later Betas from the previous NightlyRelease Beta
         required: true
-        default: auto
+        default: stable
         type: choice
         options:
           - auto
@@ -19,12 +19,12 @@ on:
       version_name:
         description: Beta APK version name and NightlyRelease tag
         required: true
-        default: 1.12.0+4-ry.2
+        default: 1.12.1-ry.3
         type: string
       version_code:
-        description: Beta APK version code; must be newer than the base APK
+        description: Beta APK version code; retain the base code for ry revisions
         required: true
-        default: '45'
+        default: '50'
         type: string
 
 concurrency:
@@ -73,22 +73,23 @@ jobs:
           version_name = os.environ["VERSION_NAME"]
           version_code = os.environ["VERSION_CODE"]
           nightly_repository = os.environ["NIGHTLY_REPOSITORY"]
-          pattern = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)\+(\d+)-ry\.(\d+)$")
+          pattern = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:\+(\d+))?-ry\.(\d+)$")
           target = pattern.fullmatch(version_name)
           if target is None:
               raise SystemExit(f"Invalid beta version name: {version_name}")
           if version_name.startswith("v"):
               raise SystemExit("version_name must not include the leading v prefix")
-          target_numbers = tuple(map(int, target.groups()))
+          target_numbers = tuple(int(value or 0) for value in target.groups())
 
           if base_mode not in {"auto", "stable"}:
               raise SystemExit(f"Invalid base mode: {base_mode}")
 
           if base_mode == "auto" and target_numbers[4] > 2:
               previous_revision = target_numbers[4] - 1
+              patch_suffix = f"+{target.group(4)}" if target.group(4) is not None else ""
               base_tag = (
                   f"v{target_numbers[0]}.{target_numbers[1]}.{target_numbers[2]}"
-                  f"+{target_numbers[3]}-ry.{previous_revision}"
+                  f"{patch_suffix}-ry.{previous_revision}"
               )
               base_repository = nightly_repository
           else:
@@ -98,7 +99,7 @@ jobs:
           base = pattern.fullmatch(base_tag)
           if base is None:
               raise SystemExit(f"Invalid differential base tag: {base_tag}")
-          base_numbers = tuple(map(int, base.groups()))
+          base_numbers = tuple(int(value or 0) for value in base.groups())
           if base_numbers[:3] != target_numbers[:3]:
               raise SystemExit("Beta and base must share the same x.y.z version")
           if target_numbers <= base_numbers:
@@ -410,8 +411,8 @@ jobs:
           test "$("$analyzer" manifest application-id "${base_apks[0]}")" = 'com.rainy.operitry'
           test "$("$analyzer" manifest version-name "${base_apks[0]}")" = "${BASE_TAG#v}"
           base_code="$("$analyzer" manifest version-code "${base_apks[0]}")"
-          if (( VERSION_CODE <= base_code )); then
-            echo "::error::Beta versionCode $VERSION_CODE must be newer than base versionCode $base_code"
+          if (( VERSION_CODE < base_code )); then
+            echo "::error::Beta versionCode $VERSION_CODE must not be lower than base versionCode $base_code"
             exit 1
           fi
           expected_digest="${OPERIT_RELEASE_CERT_SHA256//:/}"
@@ -436,13 +437,13 @@ jobs:
           import re
           import sys
 
-          pattern = re.compile(r"^v?(\d+\.\d+\.\d+)\+(\d+)-ry\.(\d+)$")
+          pattern = re.compile(r"^v?(\d+\.\d+\.\d+)(?:\+(\d+))?-ry\.(\d+)$")
           for value in sys.argv[1:]:
               match = pattern.fullmatch(value)
               if match is None:
                   raise SystemExit(f"Invalid version: {value}")
               print(match.group(1))
-              print(match.group(2))
+              print(match.group(2) or "0")
           PY
           )
           base_version="${version_parts[0]}"
