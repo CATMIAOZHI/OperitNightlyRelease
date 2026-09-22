@@ -228,11 +228,31 @@ jobs:
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: source/${{ env.MANUAL_DEPS_DIR }}
-          key: android-full-deps-${{ runner.os }}-${{ hashFiles('source/ci/script/download_android_dependencies.sh', 'source/ci/script/prepare_android_dependencies.py') }}
+          key: android-full-deps-mirror-v1-${{ runner.os }}-${{ hashFiles('source/ci/script/download_android_dependencies.sh', 'source/ci/script/prepare_android_dependencies.py') }}
 
       - name: Download Android dependencies
         if: steps.cache-manual-deps.outputs.cache-hit != 'true'
-        run: bash ci/script/download_android_dependencies.sh full "$MANUAL_DEPS_DIR"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$MANUAL_DEPS_DIR"
+          for archive in libs.zip models.zip subpack.zip jniLibs.zip; do
+            curl --fail --location --retry 3 --connect-timeout 30 --max-time 300 \
+              "https://github.com/CATMIAOZHI/Operit/releases/download/deps-v1/$archive" \
+              --output "$MANUAL_DEPS_DIR/$archive"
+          done
+
+      - name: Verify Android dependency checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$MANUAL_DEPS_DIR"
+          sha256sum --check <<'CHECKSUMS'
+          a9cf963c2bfac4ddaa0e47f66c0adc0fa9084e71c2733d3f8dd84a33957b92d2  libs.zip
+          8645d7d56266518e284e672ef9c017013238bec6d057abc1cd0b74686c1efbb8  models.zip
+          91e48b1634215c0ba91849d6e2a6353f3edee4e37317f832d1618f09f4f554fd  subpack.zip
+          8b973cc604041d6a6801a2040bab8e4f4faf7c7041cba16b6524100a866e99b3  jniLibs.zip
+          CHECKSUMS
 
       - name: Prepare Android dependencies
         run: |
