@@ -338,6 +338,16 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x ./gradlew
+          # With Gradle and a separate Kotlin daemon each given the project's 8 GiB heap, a build
+          # with cold caches ran the 16 GB runner out of memory and GitHub lost contact with it.
+          # As in Orbit's Android Build: Kotlin compiled inside Gradle, a 6 GiB heap. Settings in
+          # the Gradle user home win over the project's.
+          gradle_home="${GRADLE_USER_HOME:-$HOME/.gradle}"
+          mkdir -p "$gradle_home"
+          {
+            echo "org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8"
+            echo "kotlin.compiler.execution.strategy=in-process"
+          } >> "$gradle_home/gradle.properties"
           ./gradlew :app:assembleDebug --stacktrace
 
       - name: Verify development APK identity and signature
